@@ -1,0 +1,12 @@
+.env
+*.env
+bot/.env
+*.keystore
+*.jks
+google-services.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+*.tmp
