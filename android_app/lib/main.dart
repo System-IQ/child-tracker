@@ -329,7 +329,7 @@ class ChildTrackerTaskHandler extends TaskHandler {
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
+  Future<void> onDestroy(DateTime timestamp) async {
     debugPrint('🛑 خدمة التتبع توقفت');
     await _db?.close();
   }
