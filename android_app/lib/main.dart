@@ -1,5 +1,5 @@
-// Child Tracker - تطبيق الطفل v2
-// يستخدم HTTP مباشرة داخل الخدمة (isolate منفصل) لتجنب crash
+// Child Tracker - تطبيق الطفل v5
+// تتبع دقيق + إعادة تشغيل تلقائي + مقاومة القتل
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -7,7 +7,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:sqflite/sqflite.dart';
@@ -18,21 +17,12 @@ import 'package:device_info_plus/device_info_plus.dart';
 import 'package:uuid/uuid.dart';
 import 'package:http/http.dart' as http;
 
-// ============ الإعدادات ============
-const String SUPABASE_URL = String.fromEnvironment(
-  'SUPABASE_URL',
-  defaultValue: 'https://xxxxx.supabase.co',
-);
-const String SUPABASE_ANON_KEY = String.fromEnvironment(
-  'SUPABASE_ANON_KEY',
-  defaultValue: 'YOUR_ANON_KEY',
-);
+const String SUPABASE_URL = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://xxxxx.supabase.co');
+const String SUPABASE_ANON_KEY = String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: 'YOUR_ANON_KEY');
 
-// ============ main ============
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // تهيئة خدمة الخلفية
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'child_tracker_channel',
@@ -42,12 +32,9 @@ Future<void> main() async {
       priority: NotificationPriority.HIGH,
       onlyAlertOnce: true,
     ),
-    iosNotificationOptions: const IOSNotificationOptions(
-      showNotification: true,
-      playSound: false,
-    ),
+    iosNotificationOptions: const IOSNotificationOptions(showNotification: true, playSound: false),
     foregroundTaskOptions: ForegroundTaskOptions(
-      eventAction: ForegroundTaskEventAction.repeat(15000),
+      eventAction: ForegroundTaskEventAction.repeat(5000),  // كل 5 ثواني
       autoRunOnBoot: true,
       autoRunOnMyPackageReplaced: true,
       allowWakeLock: true,
@@ -55,38 +42,44 @@ Future<void> main() async {
     ),
   );
 
-  // تهيئة Supabase للواجهة فقط (لا تستخدم داخل الخدمة)
-  try {
-    await Supabase.initialize(url: SUPABASE_URL, anonKey: SUPABASE_ANON_KEY);
-  } catch (_) {}
+  // تشغيل تلقائي فوري
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    await _autoStart();
+  });
 
   runApp(const ChildTrackerApp());
 }
 
-// ============ Service Callback (must be top-level) ============
+Future<void> _autoStart() async {
+  try {
+    if (!await FlutterForegroundTask.isRunningService) {
+      await FlutterForegroundTask.startService(
+        notificationTitle: 'Child Tracker',
+        notificationText: 'التتبع نشط',
+        callback: startCallback,
+      );
+    }
+  } catch (_) {}
+}
+
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(ChildTrackerTaskHandler());
 }
 
-// ============ App ============
 class ChildTrackerApp extends StatelessWidget {
   const ChildTrackerApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Child Tracker',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
-        useMaterial3: true,
-      ),
+      theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal), useMaterial3: true),
       home: const HomeScreen(),
       debugShowCheckedModeBanner: false,
     );
   }
 }
 
-// ============ Home ============
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
   @override
@@ -100,17 +93,24 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _online = false;
   String? _lastError;
   Timer? _ticker;
+  StreamSubscription? _connectivitySub;
 
   @override
   void initState() {
     super.initState();
     _bootstrap();
-    _ticker = Timer.periodic(const Duration(seconds: 20), (_) => _refreshStatus());
+    _ticker = Timer.periodic(const Duration(seconds: 15), (_) => _refreshStatus());
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      final online = !results.contains(ConnectivityResult.none);
+      if (online) FlutterForegroundTask.sendDataToTask({'cmd': 'sync_now'});
+      if (mounted) setState(() => _online = online);
+    });
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _connectivitySub?.cancel();
     super.dispose();
   }
 
@@ -118,6 +118,7 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await _requestPermissions();
       await _loadDeviceId();
+      await _ensureServiceRunning();
       await _refreshStatus();
     } catch (e) {
       setState(() => _lastError = 'Bootstrap: $e');
@@ -140,24 +141,27 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _requestPermissions() async {
-    // 1. الإشعارات (Android 13+)
-    if (!await Permission.notification.isGranted) {
-      await Permission.notification.request();
-    }
-    // 2. الموقع أثناء الاستخدام
-    if (!await Permission.locationWhenInUse.isGranted) {
-      await Permission.locationWhenInUse.request();
-    }
-    // 3. الموقع الدائم (Background)
-    if (await Permission.locationWhenInUse.isGranted &&
-        !await Permission.locationAlways.isGranted) {
+    if (!await Permission.notification.isGranted) await Permission.notification.request();
+    if (!await Permission.locationWhenInUse.isGranted) await Permission.locationWhenInUse.request();
+    if (await Permission.locationWhenInUse.isGranted && !await Permission.locationAlways.isGranted) {
       await Permission.locationAlways.request();
     }
-    // 4. تحسين البطارية
     if (!await Permission.ignoreBatteryOptimizations.isGranted) {
-      try {
-        await Permission.ignoreBatteryOptimizations.request();
-      } catch (_) {}
+      try { await Permission.ignoreBatteryOptimizations.request(); } catch (_) {}
+    }
+  }
+
+  Future<void> _ensureServiceRunning() async {
+    try {
+      if (!await FlutterForegroundTask.isRunningService) {
+        await FlutterForegroundTask.startService(
+          notificationTitle: 'Child Tracker',
+          notificationText: 'التتبع نشط',
+          callback: startCallback,
+        );
+      }
+    } catch (e) {
+      setState(() => _lastError = 'Service: $e');
     }
   }
 
@@ -174,42 +178,6 @@ class _HomeScreenState extends State<HomeScreen> {
         _status = isRunning ? '🟢 التتبع نشط' : '🔴 التتبع متوقف';
       });
     } catch (_) {}
-  }
-
-  Future<void> _startService() async {
-    setState(() => _lastError = null);
-    try {
-      // اطلب الإشعارات مرة أخرى
-      if (!await Permission.notification.isGranted) {
-        await Permission.notification.request();
-      }
-      if (!await Permission.locationWhenInUse.isGranted) {
-        await Permission.locationWhenInUse.request();
-        return;
-      }
-
-      if (await FlutterForegroundTask.isRunningService) {
-        await FlutterForegroundTask.restartService();
-      } else {
-        await FlutterForegroundTask.startService(
-          notificationTitle: 'Child Tracker',
-          notificationText: 'التتبع نشط',
-          callback: startCallback,
-        );
-      }
-      await _refreshStatus();
-    } catch (e, st) {
-      setState(() => _lastError = 'Start: $e\n${st.toString().split('\n').take(3).join('\n')}');
-    }
-  }
-
-  Future<void> _stopService() async {
-    try {
-      await FlutterForegroundTask.stopService();
-      await _refreshStatus();
-    } catch (e) {
-      setState(() => _lastError = 'Stop: $e');
-    }
   }
 
   @override
@@ -234,30 +202,27 @@ class _HomeScreenState extends State<HomeScreen> {
                 color: Colors.red.shade50,
                 child: Padding(
                   padding: const EdgeInsets.all(12),
-                  child: Text(
-                    'آخر خطأ:\n$_lastError',
-                    style: const TextStyle(color: Colors.red, fontSize: 12),
-                  ),
+                  child: Text('آخر خطأ:\n$_lastError',
+                      style: const TextStyle(color: Colors.red, fontSize: 12)),
                 ),
               ),
             const SizedBox(height: 16),
             ElevatedButton.icon(
-              onPressed: _startService,
+              onPressed: _ensureServiceRunning,
               icon: const Icon(Icons.play_arrow),
               label: const Text('تشغيل التتبع'),
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 14),
-              ),
+              style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
             ),
             const SizedBox(height: 12),
             ElevatedButton.icon(
-              onPressed: _stopService,
+              onPressed: () async {
+                await FlutterForegroundTask.stopService();
+                await _refreshStatus();
+              },
               icon: const Icon(Icons.stop),
               label: const Text('إيقاف مؤقت'),
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.orange,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-              ),
+                  backgroundColor: Colors.orange, padding: const EdgeInsets.symmetric(vertical: 14)),
             ),
           ],
         ),
@@ -281,12 +246,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-// ============ TaskHandler (runs in separate isolate) ============
+// ═══════════════ الخدمة (isolate منفصل) ═══════════════
 class ChildTrackerTaskHandler extends TaskHandler {
   Database? _db;
   String? _deviceId;
   bool _isSyncing = false;
   DateTime? _lastSyncTime;
+  DateTime? _lastGpsError;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
@@ -297,12 +263,20 @@ class ChildTrackerTaskHandler extends TaskHandler {
     } catch (_) {}
   }
 
+  @override
+  void onReceiveData(Map<String, dynamic> data) {
+    if (data['cmd'] == 'sync_now') {
+      _lastSyncTime = null;
+      _syncPending();
+    }
+  }
+
   Future<void> _loadDeviceId() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       _deviceId = prefs.getString('device_id');
     } catch (_) {
-      _deviceId = 'unknown_device';
+      _deviceId = 'unknown';
     }
   }
 
@@ -317,15 +291,8 @@ class ChildTrackerTaskHandler extends TaskHandler {
           await db.execute('''
             CREATE TABLE pending_locations (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              device_id TEXT,
-              latitude REAL,
-              longitude REAL,
-              altitude REAL,
-              speed REAL,
-              accuracy REAL,
-              heading REAL,
-              battery INTEGER,
-              timestamp TEXT
+              device_id TEXT, latitude REAL, longitude REAL, altitude REAL,
+              speed REAL, accuracy REAL, heading REAL, battery INTEGER, timestamp TEXT
             )
           ''');
         },
@@ -336,15 +303,21 @@ class ChildTrackerTaskHandler extends TaskHandler {
   @override
   Future<void> onRepeatEvent(DateTime timestamp) async {
     try {
-      final position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-        timeLimit: const Duration(seconds: 15),
-      );
-
-      int batteryLevel = 0;
+      // جلب الموقع بدقة عالية
+      Position? position;
       try {
-        batteryLevel = await Battery().batteryLevel;
-      } catch (_) {}
+        position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.best,
+          timeLimit: const Duration(seconds: 12),
+        );
+      } catch (e) {
+        _lastGpsError = DateTime.now();
+        return;
+      }
+
+      // الحصول على البطارية
+      int batteryLevel = 0;
+      try { batteryLevel = await Battery().batteryLevel; } catch (_) {}
 
       final point = {
         'device_id': _deviceId,
@@ -359,25 +332,23 @@ class ChildTrackerTaskHandler extends TaskHandler {
       };
 
       await _initDb();
-      if (_db != null) {
-        await _db!.insert('pending_locations', point);
-      }
+      if (_db != null) await _db!.insert('pending_locations', point);
 
       await FlutterForegroundTask.updateService(
         notificationText:
             'موقع: ${position.latitude.toStringAsFixed(4)}, ${position.longitude.toStringAsFixed(4)} | 🔋$batteryLevel%',
       );
 
-      await _syncPending();
+      // محاولة المزامنة بسرعة (كل 5 ثوانٍ بحد أقصى)
+      if (_lastSyncTime == null ||
+          DateTime.now().difference(_lastSyncTime!).inSeconds >= 5) {
+        await _syncPending();
+      }
     } catch (_) {}
   }
 
   Future<void> _syncPending() async {
     if (_isSyncing) return;
-    if (_lastSyncTime != null &&
-        DateTime.now().difference(_lastSyncTime!) < const Duration(seconds: 45)) {
-      return;
-    }
     _isSyncing = true;
     try {
       final conn = await Connectivity().checkConnectivity();
@@ -385,10 +356,9 @@ class ChildTrackerTaskHandler extends TaskHandler {
       await _initDb();
       if (_db == null) return;
 
-      final pending = await _db!.query('pending_locations', orderBy: 'id ASC', limit: 100);
+      final pending = await _db!.query('pending_locations', orderBy: 'id ASC', limit: 200);
       if (pending.isEmpty) return;
 
-      // استخدم HTTP مباشرة بدل Supabase client
       final url = Uri.parse('$SUPABASE_URL/rest/v1/locations');
       final res = await http.post(
         url,
@@ -399,9 +369,9 @@ class ChildTrackerTaskHandler extends TaskHandler {
           'Prefer': 'return=minimal',
         },
         body: jsonEncode(pending),
-      );
+      ).timeout(const Duration(seconds: 15));
 
-      if (res.statusCode == 201 || res.statusCode == 200 || res.statusCode == 204) {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
         final ids = pending.map((e) => e['id']).join(',');
         await _db!.delete('pending_locations', where: 'id IN ($ids)');
         _lastSyncTime = DateTime.now();
@@ -414,15 +384,11 @@ class ChildTrackerTaskHandler extends TaskHandler {
 
   @override
   Future<void> onDestroy(DateTime timestamp) async {
-    try {
-      await _db?.close();
-    } catch (_) {}
+    try { await _db?.close(); } catch (_) {}
   }
 
   @override
-  void onNotificationPressed() {
-    FlutterForegroundTask.launchApp();
-  }
+  void onNotificationPressed() => FlutterForegroundTask.launchApp();
 
   @override
   void onNotificationButtonPressed(String id) {}
