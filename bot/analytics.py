@@ -104,3 +104,74 @@ def daily_summary(points: List[Dict]) -> Dict:
         "n_stops": len(stops),
         "top_stops": stops[:3],
     }
+
+
+def _duration_seconds(start_ts: str, end_ts: str) -> float:
+    """يحسب الفرق بالثواني بين timestampين ISO"""
+    try:
+        s = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+        e = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+        return max(0.0, (e - s).total_seconds())
+    except Exception:
+        return 0.0
+
+
+def find_stops(points: List[Dict], min_duration_min: float = 3.0,
+               max_distance_m: float = 80.0) -> List[Dict]:
+    """
+    يكتشف أماكن التوقف مع المدة الدقيقة.
+    - min_duration_min: أقصر مدة لاعتبارها توقفاً (دقائق)
+    - max_distance_m: أقصى مسافة بين النقاط لاعتبارها نفس المكان (أمتار)
+    """
+    if not points or len(points) < 2:
+        return []
+
+    # ترتيب زمني
+    pts = sorted(points, key=lambda p: p.get("timestamp", ""))
+    stops = []
+    current = None
+
+    for p in pts:
+        lat, lon = p.get("latitude"), p.get("longitude")
+        ts = p.get("timestamp")
+        if lat is None or lon is None or not ts:
+            continue
+
+        if current is None:
+            current = {"lat": lat, "lon": lon, "start": ts, "end": ts,
+                       "points": [p]}
+            continue
+
+        d = haversine_m(current["lat"], current["lon"], lat, lon)
+        if d <= max_distance_m:
+            current["points"].append(p)
+            current["end"] = ts
+            # تحديث المركز
+            n = len(current["points"])
+            current["lat"] = sum(x["latitude"] for x in current["points"]) / n
+            current["lon"] = sum(x["longitude"] for x in current["points"]) / n
+        else:
+            dur = _duration_seconds(current["start"], current["end"])
+            if dur >= min_duration_min * 60 and len(current["points"]) >= 2:
+                stops.append({
+                    "lat": current["lat"], "lon": current["lon"],
+                    "start": current["start"], "end": current["end"],
+                    "duration_sec": dur,
+                    "points_count": len(current["points"]),
+                })
+            current = {"lat": lat, "lon": lon, "start": ts, "end": ts,
+                       "points": [p]}
+
+    # آخر توقف
+    if current and len(current["points"]) >= 2:
+        dur = _duration_seconds(current["start"], current["end"])
+        if dur >= min_duration_min * 60:
+            stops.append({
+                "lat": current["lat"], "lon": current["lon"],
+                "start": current["start"], "end": current["end"],
+                "duration_sec": dur,
+                "points_count": len(current["points"]),
+            })
+
+    stops.sort(key=lambda x: x["duration_sec"], reverse=True)
+    return stops
